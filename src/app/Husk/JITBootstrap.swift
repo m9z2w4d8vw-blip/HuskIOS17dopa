@@ -94,6 +94,11 @@ enum JITBootstrap {
             lastFailure = nil
             HuskLog.log("jit", "no trap servicer, but MAP_JIT executes here -- "
                              + "QEMU will map its own buffer")
+        } else if let poisoned = poisonedExplanation {
+            // A route that SIGKILLed an earlier launch was skipped this time. Say so: the previous message blamed a
+            // container app, which is the wrong thing to go chasing on a jailbroken device.
+            lastFailure = poisoned
+            HuskLog.log("jit", "prewarm skipped the '\(poisonedRoute ?? "?")' route -- it killed an earlier launch")
         } else {
             lastFailure = "The debugger is attached but is not answering trap "
                         + "requests, and this device will not execute a MAP_JIT "
@@ -122,6 +127,44 @@ enum JITBootstrap {
 
     /// The one try at making the region without a debugger has been made (it is not repeated: the answer will not change).
     nonisolated(unsafe) static private var selfGrantTried = false
+
+    /// Which route into executable memory killed the app on an earlier launch, if any.
+    ///
+    /// Proving a route works ends in a call into a page Husk wrote. Where the kernel refuses that it does not fault --
+    /// it kills the process with SIGKILL, which catches no handler and writes no crash report, so nothing appears in
+    /// Analytics and the log simply stops mid-sentence. Before iOS 26 that is reachable on a jailbroken device whose
+    /// kernel reports CS_DEBUGGED and still will not execute an unsigned page; iOS 17 on arm64e under Dopamine does
+    /// exactly this. Since the attempt used to be made at every launch, the result was a crash loop a fraction of a
+    /// second after the icon was tapped, with no way to reach Settings and choose another method.
+    ///
+    /// The native side now records each attempt on disk before the branch and erases it after. This reads back whatever
+    /// marker outlived a launch.
+    static var poisonedRoute: String? {
+        husk_ios_jit_poisoned_route().map { String(cString: $0) }
+    }
+
+    /// Forget the failed routes so all of them are tried again. Offer this after the user changes how JIT is granted:
+    /// turning on Dopamine's "Allow JIT in Apps", reinstalling the `.ipa` through TrollStore so `dynamic-codesigning`
+    /// is honoured, or installing StikDebug.
+    static func clearPoisonedRoutes() {
+        husk_ios_jit_clear_poison()
+        HuskLog.log("jit", "cleared the failed-route markers at the user's request")
+    }
+
+    /// What to tell the user when a route has killed the app before. Plain English: the cause is not something they can
+    /// see, and the fix is a choice between three concrete actions.
+    static var poisonedExplanation: String? {
+        guard let route = poisonedRoute else { return nil }
+        let what = route == "plain"
+            ? "This device reports that Husk may write its own executable memory, and then refuses to run it."
+            : "The executable memory Husk was granted could not be run."
+        return what
+            + " iOS ends that attempt by killing Husk outright, which is why it closed instantly and left no crash "
+            + "report. Husk will not try that route again.\n\n"
+            + "To get JIT here: install StikDebug alongside Husk, or install Husk's .ipa (not the .tipa) through "
+            + "TrollStore so its dynamic-codesigning entitlement is kept, or turn on \"Allow JIT in Apps\" in Dopamine. "
+            + "Then tap Try All Methods Again."
+    }
 
     /// Whether Husk has JIT now: a debugger marked it, or the region is already held. Before iOS 26 this tries, once, to make
     /// the region itself, which is all TrollStore and jailbroken devices need. Cheap after the first call, and logs nothing.

@@ -184,9 +184,26 @@ ENT="$STAGE/entitlements.plist"
 cp "$ENT_BASE" "$ENT"
 BANNED_KEYS=(
     "com.apple.private.cs.debugger"
-    "dynamic-codesigning"
     "com.apple.private.skip-library-validation"
 )
+# dynamic-codesigning used to be stripped from .tipa builds along with the two
+# private entitlements above. It is not a private entitlement and TrollStore does
+# not reject it -- RootHelper's signApp reads entitlements straight off the binary
+# and keeps them -- so stripping it only removed the one route to JIT that does
+# not involve executing an unsigned page.
+#
+# What that cost, on iOS 17/arm64e under Dopamine: MAP_JIT comes back EPERM
+# without the entitlement, so husk_self_dual_mapping falls through to making
+# plain memory executable, and the kernel answers the call into that page with
+# SIGKILL. No signal handler sees it and no crash report is written, so the app
+# vanishes under a second after launch with nothing in Analytics. The .ipa kept
+# the entitlement and the .tipa did not, which is why the file named for
+# TrollStore was the one that could not use TrollStore's own JIT route.
+#
+# Set HUSK_STRIP_DYNAMIC_CODESIGNING=1 to get the old behaviour back.
+if [ "$TROLLSTORE" = true ] && [ "${HUSK_STRIP_DYNAMIC_CODESIGNING:-0}" = "1" ]; then
+    BANNED_KEYS+=("dynamic-codesigning")
+fi
 if [ "$TROLLSTORE" = true ]; then
     for key in "${BANNED_KEYS[@]}"; do
         plutil -remove "$key" "$ENT" 2>/dev/null || true
@@ -201,7 +218,12 @@ sign --entitlements "$ENT" "$SAPP"
 echo "==> entitlements in the signed app:"
 EMBEDDED_ENTS=$(codesign -d --entitlements - "$SAPP" 2>&1 || true)
 REQUIRED_PATTERN="get-task-allow|increased-memory|extended-virtual"
-[ "$TROLLSTORE" != true ] && REQUIRED_PATTERN+="|dynamic-codesigning"
+# Expected in both packages now, so the .tipa is checked for it as well. Written
+# as an if rather than `[ ... ] && VAR+=...`, which under `set -e` makes the
+# whole line's exit status the failed test's.
+if [ "$TROLLSTORE" != true ] || [ "${HUSK_STRIP_DYNAMIC_CODESIGNING:-0}" != "1" ]; then
+    REQUIRED_PATTERN+="|dynamic-codesigning"
+fi
 if ! grep -qE "$REQUIRED_PATTERN" <<< "$EMBEDDED_ENTS"; then
     echo "==> entitlements did not embed; refusing to package" >&2
     rm -rf "$STAGE"

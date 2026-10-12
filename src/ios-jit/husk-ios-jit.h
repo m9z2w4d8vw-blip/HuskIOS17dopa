@@ -122,6 +122,33 @@ HUSK_EXPORT bool husk_ios_jit_mapjit_works(void);
 HUSK_EXPORT const char *husk_ios_jit_self_route(void);
 
 /*
+ * Which JIT route, if any, killed this app on a previous launch: "mapjit",
+ * "plain", "probe", or NULL when none has.
+ *
+ * Proving a route works means calling into a page we wrote. Where the kernel
+ * refuses that it does not raise a signal -- it kills the process with SIGKILL,
+ * which no handler survives and which produces no crash report at all. Before
+ * iOS 26 that is reachable on a jailbroken device whose kernel reports
+ * CS_DEBUGGED but still will not execute an unsigned page (iOS 17/arm64e under
+ * Dopamine does exactly this), and because the attempt was made at every launch
+ * the result was an unbreakable crash loop a fraction of a second after the
+ * icon was tapped, with nothing in Analytics to show for it.
+ *
+ * A marker file is therefore written before the dangerous branch and removed
+ * after it returns. One still present at startup names the route that killed us,
+ * and that route is not tried again. Show this in Settings: it is the only
+ * evidence the user will ever get.
+ */
+HUSK_EXPORT const char *husk_ios_jit_poisoned_route(void);
+
+/*
+ * Forget which routes have failed, so all of them are tried again. Offer this
+ * after the user changes how JIT is granted -- turning on Dopamine's "Allow JIT
+ * in Apps", reinstalling through TrollStore, installing StikDebug.
+ */
+HUSK_EXPORT void husk_ios_jit_clear_poison(void);
+
+/*
  * Log the process's phys_footprint -- the number jetsam actually kills on.
  * `tag` labels the call site in the log.
  */

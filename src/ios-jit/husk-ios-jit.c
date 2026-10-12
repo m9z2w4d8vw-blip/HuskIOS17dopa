@@ -23,6 +23,7 @@
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/time.h>
@@ -281,6 +282,115 @@ static bool husk_jit_selftest(const HuskDualMapping *m)
 }
 
 
+/* --------------------------------------------------------- crash sentinel */
+/*
+ * Surviving the one failure mode that leaves no evidence.
+ *
+ * Every route below proves itself by writing two instructions into a page and
+ * calling them. Where the kernel allows that, it returns 0x5a5a. Where it does
+ * not, the answer is not a signal: the kernel's code-signing enforcement kills
+ * the process outright with SIGKILL. No handler runs, siglongjmp never happens,
+ * ReportCrash writes nothing, and nothing reaches Analytics -- the app simply
+ * vanishes a fraction of a second after launch. The log stops mid-sentence at
+ * whatever was printed before the call.
+ *
+ * That is survivable exactly once. The problem is that it is attempted on every
+ * launch, so a device the plain route cannot work on is in a crash loop with no
+ * way out: the app never lives long enough to reach Settings and pick another
+ * JIT method, and the user has nothing to go on.
+ *
+ * So the attempt is recorded on disk before the dangerous branch and erased
+ * after it returns. A sentinel still present at the next launch means that exact
+ * route killed us, and it is not tried again. One crash, then a working app with
+ * "JIT unavailable" instead of an unbreakable loop.
+ *
+ * The file is opened, written, fsync'd and closed before the call, because
+ * SIGKILL gives no chance to flush anything afterwards. Documents is used
+ * because husk.log already lives there, so it is known writable and is not
+ * purged the way Caches is -- and because UIFileSharingEnabled makes it visible
+ * under "On My iPhone > Husk" in the Files app. The name deliberately carries no
+ * leading dot so that a user whose app will not open can delete the marker there
+ * and get the route retried, with no jailbreak tooling involved.
+ */
+#define HUSK_JIT_ROUTE_MAPJIT "mapjit"
+#define HUSK_JIT_ROUTE_PLAIN  "plain"
+#define HUSK_JIT_ROUTE_PROBE  "probe"
+
+static bool husk_sentinel_path(char *buf, size_t n, const char *route)
+{
+    const char *home = getenv("HOME");
+    if (!home || !*home) {
+        return false;
+    }
+    int written = snprintf(buf, n, "%s/Documents/husk-jit-%s.attempt", home, route);
+    return written > 0 && (size_t)written < n;
+}
+
+/* Which route, if any, killed the process last time. NULL until something is found. */
+static const char *volatile g_poisoned_route;
+
+const char *husk_ios_jit_poisoned_route(void) { return g_poisoned_route; }
+
+static bool husk_route_poisoned(const char *route)
+{
+    char path[1024];
+    if (!husk_sentinel_path(path, sizeof(path), route)) {
+        return false;   /* cannot tell: behave as before rather than refusing a route that may work */
+    }
+    if (access(path, F_OK) != 0) {
+        return false;
+    }
+    g_poisoned_route = route;
+    HUSK_LOG("sentinel: the '%s' route killed this app on a previous launch "
+             "(code-signing kill -- no crash report is produced for those). "
+             "Not trying it again. Turn on \"Allow JIT in Apps\" in Dopamine, "
+             "install the .ipa through TrollStore so dynamic-codesigning is "
+             "kept, or use StikDebug. To have this route retried, delete "
+             "Documents/husk-jit-%s.attempt (visible in the Files app under "
+             "\"On My iPhone > Husk\").", route, route);
+    return true;
+}
+
+/* Record the attempt durably. Returns false only if nothing could be written, in which case the caller must not proceed:
+ * an unrecorded attempt that dies is exactly the crash loop this exists to prevent. */
+static bool husk_route_arm(const char *route)
+{
+    char path[1024];
+    if (!husk_sentinel_path(path, sizeof(path), route)) {
+        HUSK_LOG("sentinel: no writable location for the '%s' marker; skipping "
+                 "the route rather than risking an unrecorded kill", route);
+        return false;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) {
+        HUSK_LOG("sentinel: could not write the '%s' marker (%s); skipping the "
+                 "route rather than risking an unrecorded kill", route, strerror(errno));
+        return false;
+    }
+    (void)!write(fd, route, strlen(route));
+    fsync(fd);
+    close(fd);
+    return true;
+}
+
+static void husk_route_disarm(const char *route)
+{
+    char path[1024];
+    if (husk_sentinel_path(path, sizeof(path), route)) {
+        unlink(path);
+    }
+}
+
+/* Let the user try again after changing Dopamine's settings or reinstalling. */
+void husk_ios_jit_clear_poison(void)
+{
+    husk_route_disarm(HUSK_JIT_ROUTE_MAPJIT);
+    husk_route_disarm(HUSK_JIT_ROUTE_PLAIN);
+    husk_route_disarm(HUSK_JIT_ROUTE_PROBE);
+    g_poisoned_route = NULL;
+    HUSK_LOG("sentinel: cleared; every JIT route will be tried again on the next launch");
+}
+
 /* ------------------------------------------------------------ self-granted */
 /*
  * Executable memory without a trap servicer, before iOS 26 (no TXM). This is how TrollStore and jailbreaks give an app JIT:
@@ -321,11 +431,17 @@ static void husk_self_fault(int sig)
     raise(sig);
 }
 
-static bool husk_self_selftest(uint8_t *rx, uint8_t *rw)
+/*
+ * `route` names the sentinel this call is covered by. The signal guard below
+ * catches a page that faults; it cannot catch a code-signing kill, which is why
+ * the attempt is on disk before the branch and gone after it.
+ */
+static bool husk_self_selftest(uint8_t *rx, uint8_t *rw, const char *route)
 {
     /* movz w0, #0x5a5a ; ret */
     static const uint32_t code[2] = { 0x528B4B40u, 0xD65F03C0u };
     if (!husk_page_is_executable(rx)) return false;
+    if (!husk_route_arm(route)) return false;
     struct sigaction sa, ob, os, oi;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = husk_self_fault;
@@ -340,6 +456,7 @@ static bool husk_self_selftest(uint8_t *rx, uint8_t *rw)
     }
     g_self_running = 0;
     sigaction(SIGBUS, &ob, NULL); sigaction(SIGSEGV, &os, NULL); sigaction(SIGILL, &oi, NULL);
+    husk_route_disarm(route);
     return ok;
 }
 
@@ -379,13 +496,25 @@ static HuskDualMapping husk_self_dual_mapping(size_t bytes)
     }
     size_t size = (bytes + 0x3fff) & ~(size_t)0x3fff;
 
-    /* 1. MAP_JIT, honoured where dynamic-codesigning is (TrollStore). Refused with EPERM elsewhere, harmlessly. */
-    uint8_t *rx = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    /* 1. MAP_JIT, honoured where dynamic-codesigning is (TrollStore). Refused with EPERM elsewhere, harmlessly.
+     *
+     * Note which failure this is when it comes back EPERM: it means the process does not hold dynamic-codesigning. A
+     * .tipa built by package_ipa.sh has that entitlement stripped on purpose, so a TrollStore install of the .tipa can
+     * never take this route and always falls through to the plain one below. The .ipa keeps it. */
+    uint8_t *rx = MAP_FAILED;
+    bool mapjit_skipped = husk_route_poisoned(HUSK_JIT_ROUTE_MAPJIT);
+    if (!mapjit_skipped) {
+        rx = mmap(NULL, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
+    }
     if (rx == MAP_FAILED) {
-        HUSK_LOG("self: MAP_JIT refused (%s)", strerror(errno));
+        /* Only report errno when a call actually set it -- a skipped route would print whatever was left over. */
+        if (!mapjit_skipped) {
+            HUSK_LOG("self: MAP_JIT refused (%s) -- no dynamic-codesigning entitlement is honoured for this process",
+                     strerror(errno));
+        }
     } else {
         uint8_t *rw = husk_rw_alias(rx, size, false);
-        if (rw && husk_self_selftest(rx, rw)) {
+        if (rw && husk_self_selftest(rx, rw, HUSK_JIT_ROUTE_MAPJIT)) {
             HuskDualMapping m = { rw, rx, size };
             atomic_store(&g_jit_available, true);
             g_self_route = "MAP_JIT";
@@ -397,7 +526,14 @@ static HuskDualMapping husk_self_dual_mapping(size_t bytes)
         munmap(rx, size);
     }
 
-    /* 2. Plain memory made executable: only where invalid pages are known to be allowed. */
+    /* 2. Plain memory made executable: only where invalid pages are known to be allowed.
+     *
+     * "Known" is doing a lot of work in that sentence. The test is CS_DEBUGGED or the presence of /var/jb, and neither
+     * actually proves the kernel will execute an unsigned page -- on iOS 17/arm64e under Dopamine both can be true while
+     * the branch below is still a code-signing kill. The sentinel is what makes that survivable. */
+    if (husk_route_poisoned(HUSK_JIT_ROUTE_PLAIN)) {
+        return none;
+    }
     bool debugged = husk_kernel_debugged();
     bool jailbroken = access("/var/jb", F_OK) == 0;
     if (!debugged && !jailbroken) {
@@ -411,7 +547,7 @@ static HuskDualMapping husk_self_dual_mapping(size_t bytes)
     }
     rx = mmap(base, size, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0);
     uint8_t *rw = rx == MAP_FAILED ? NULL : husk_rw_alias(rx, size, true);
-    if (rw && vm_protect(mach_task_self(), (vm_address_t)rx, size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS && husk_self_selftest(rx, rw)) {
+    if (rw && vm_protect(mach_task_self(), (vm_address_t)rx, size, FALSE, VM_PROT_READ | VM_PROT_EXECUTE) == KERN_SUCCESS && husk_self_selftest(rx, rw, HUSK_JIT_ROUTE_PLAIN)) {
         HuskDualMapping m = { rw, rx, size };
         atomic_store(&g_jit_available, true);
         g_self_route = "plain";
@@ -732,6 +868,13 @@ bool husk_ios_jit_mapjit_works(void)
     const size_t len = 16 * 1024;   /* one iOS page */
     bool ok = false;
 
+    /* This probe ends in a call into a page it wrote, so it carries the same risk as the routes above and the same
+     * sentinel. A device that answered that question with SIGKILL once must not be asked twice. */
+    if (husk_route_poisoned(HUSK_JIT_ROUTE_PROBE)) {
+        atomic_store(&cached, -1);
+        return false;
+    }
+
     void *p = mmap(NULL, len, PROT_READ | PROT_WRITE | PROT_EXEC,
                    MAP_PRIVATE | MAP_ANON | MAP_JIT, -1, 0);
     if (p == MAP_FAILED) {
@@ -745,6 +888,12 @@ bool husk_ios_jit_mapjit_works(void)
     if (!husk_page_is_executable(p)) {
         HUSK_LOG("MAP_JIT probe: the mapping came back without execute permission "
                  "-- a trap servicer is the only route on this device");
+        munmap(p, len);
+        atomic_store(&cached, -1);
+        return false;
+    }
+
+    if (!husk_route_arm(HUSK_JIT_ROUTE_PROBE)) {
         munmap(p, len);
         atomic_store(&cached, -1);
         return false;
@@ -780,6 +929,7 @@ bool husk_ios_jit_mapjit_works(void)
     sigaction(SIGBUS, &prev_bus, NULL);
     sigaction(SIGSEGV, &prev_segv, NULL);
     sigaction(SIGILL, &prev_ill, NULL);
+    husk_route_disarm(HUSK_JIT_ROUTE_PROBE);
     munmap(p, len);
 
     HUSK_LOG("MAP_JIT probe: %s", ok
@@ -809,6 +959,8 @@ void husk_ios_jit_detach(void) {}
 bool husk_ios_jit_is_available(void) { return false; }
 bool husk_ios_jit_mapjit_works(void) { return false; }
 const char *husk_ios_jit_self_route(void) { return 0; }
+const char *husk_ios_jit_poisoned_route(void) { return 0; }
+void husk_ios_jit_clear_poison(void) {}
 void husk_ios_jit_log_footprint(const char *tag) { (void)tag; }
 size_t husk_ios_available_memory(void) { return 0; }
 
